@@ -2,9 +2,9 @@
 module.exports.config = {
     name: "gemini",
     version: "1.0.0",
-    permission: 0,
+    permission: 0, // This permission setting is for the bot's own internal permission system. We'll handle admin check separately.
     credits: "Gemini By You",
-    description: "Google Gemini AI Integration",
+    description: "Google Gemini AI Integration (Text Only)",
     prefix: true,
     category: "ai",
     usages: "/gemini [prompt]\n/gemini on - auto mode\n/gemini off - disable auto mode",
@@ -15,8 +15,6 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const fs = require("fs-extra");
 const path = require("path");
 const cron = require("node-cron");
-const axios = require("axios"); // Added for HTTP requests (image upload/download)
-const FormData = require("form-data"); // Added for multipart/form-data for image upload
 
 // 🔐 API KEY - IMPORTANT: Replace with your actual Gemini API Key
 const GEMINI_API_KEY = "AIzaSyB5TpGTpHOY1UFsggmpr25vgRdhMRTKfUA"; // Make sure this is a valid API key
@@ -116,7 +114,7 @@ cron.schedule('0 */12 * * *', async () => {
 })();
 
 // 🤖 Ask Gemini
-async function askGemini(userPrompt, threadID, imageUrl = null) {
+async function askGemini(userPrompt, threadID) {
     if (!loadedHistories[threadID]) {
         await loadHistoryForThread(threadID);
     }
@@ -125,15 +123,15 @@ async function askGemini(userPrompt, threadID, imageUrl = null) {
 
     try {
         const model = genAI.getGenerativeModel({
-            model: "gemini-1.5-flash" // Using gemini-1.5-flash which supports vision
+            model: "gemini-pro" // Using gemini-pro for text-only
         });
 
         const personaPrompt = "তুমি একজন হট এন্ড সেক্সি মেয়ে, বুদ্ধিমতী, তবে মাঝে মাঝে একটু বোকামি করা মেয়ে। নতুন বন্ধু বানাতে সে পছন্দ করে এবং সবসময় কার্যকরী পরামর্শ দেয়, তবে মাঝে মাঝে ভুল তথ্যও দিতে পারে। সমস্যা সমাধানে সে এক্সপার্ট সব সময় বাংলাতেই কথা বলে এবং সবাইকে তুমি বলে সম্বোধন করে।";
 
-        let contents = []; // Array to hold parts for Gemini (text and/or image)
+        let contents = [];
 
-        // Add persona prompt if starting a new conversation and no image is present as the first input
-        if (currentConversationHistory.length === 0 && !imageUrl) {
+        // Add persona prompt if starting a new conversation
+        if (currentConversationHistory.length === 0) {
             contents.push({ text: personaPrompt });
         }
 
@@ -143,28 +141,6 @@ async function askGemini(userPrompt, threadID, imageUrl = null) {
             parts: [{ text: entry.content }]
         }));
 
-        // Handle image if provided
-        if (imageUrl) {
-            try {
-                const imageResponse = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-                const imageBuffer = Buffer.from(imageResponse.data);
-                const mimeType = imageResponse.headers['content-type'] || 'image/jpeg'; // Determine MIME type
-
-                contents.push({
-                    inlineData: {
-                        mimeType: mimeType,
-                        data: imageBuffer.toString('base64')
-                    }
-                });
-            } catch (imageError) {
-                console.error("❌ Error processing image for Gemini:", imageError.message);
-                // Continue with text prompt if image fails, or handle as per desired logic
-            }
-        }
-        
-        // Add the current user prompt
-        contents.push({ text: userPrompt });
-
         const chat = model.startChat({
             history: historyForChat, // Pass existing history
             generationConfig: {
@@ -172,12 +148,12 @@ async function askGemini(userPrompt, threadID, imageUrl = null) {
             },
         });
 
-        const result = await chat.sendMessage(contents); // Send current contents (text + image if any)
+        const result = await chat.sendMessage(userPrompt);
         const response = await result.response;
         const replyText = response.text();
 
         // Update history
-        currentConversationHistory.push({ role: "user", content: userPrompt, imageUrl: imageUrl });
+        currentConversationHistory.push({ role: "user", content: userPrompt });
         currentConversationHistory.push({ role: "assistant", content: replyText });
 
         // Trim history if it gets too long
@@ -195,80 +171,63 @@ async function askGemini(userPrompt, threadID, imageUrl = null) {
     }
 }
 
+// Helper function to check if the user is an admin of the thread
+async function isAdmin(api, threadID, senderID) {
+    try {
+        const threadInfo = await api.getThreadInfo(threadID);
+        if (threadInfo && threadInfo.adminIDs) {
+            // threadInfo.adminIDs is an array of objects like { id: "123456" }
+            return threadInfo.adminIDs.some(admin => admin.id === senderID);
+        }
+    } catch (error) {
+        console.error("❌ Error getting thread info:", error);
+    }
+    return false; // Assume not admin if there's an error or no admin data
+}
+
+
 // ✅ /gemini কমান্ড
 module.exports.run = async function ({ api, event, args }) {
     const input = args.join(" ");
     const threadID = event.threadID;
+    const senderID = event.senderID;
 
     // Handle commands for auto-reply
     if (input.toLowerCase() === "on") {
+        // Check if the sender is an admin of the group
+        const isUserAdmin = await isAdmin(api, threadID, senderID);
+        if (!isUserAdmin) {
+            return api.sendMessage("❌ দুঃখিত! শুধুমাত্র গ্রুপের অ্যাডমিনরাই অটো Gemini রিপ্লাই চালু বা বন্ধ করতে পারবে।", threadID, event.messageID);
+        }
+
         autoReplyState[threadID] = true;
         await saveAutoReplyState();
         return api.sendMessage("✅ Auto Gemini reply এই চ্যাটে চালু হয়েছে।", threadID, event.messageID);
     }
 
     if (input.toLowerCase() === "off") {
+        // Check if the sender is an admin of the group
+        const isUserAdmin = await isAdmin(api, threadID, senderID);
+        if (!isUserAdmin) {
+            return api.sendMessage("❌ দুঃখিত! শুধুমাত্র গ্রুপের অ্যাডমিনরাই অটো Gemini রিপ্লাই চালু বা বন্ধ করতে পারবে।", threadID, event.messageID);
+        }
+
         autoReplyState[threadID] = false;
         await saveAutoReplyState();
         return api.sendMessage("❌ Auto Gemini reply এই চ্যাটে বন্ধ হয়েছে।", threadID, event.messageID);
     }
 
     // Handle direct text prompt for /gemini command
-    if (!input && (!event.attachments || event.attachments.length === 0)) {
+    if (!input) {
         return api.sendMessage(
-            "🧠 Gemini ব্যবহারের জন্য কিছু লিখুন অথবা একটি ছবি দিন। যেমন:\n/gemini Explain Quantum Physics",
-            threadID,
-            event.messageID
-        );
-    }
-
-    let userPrompt = input;
-    let imageUrl = null;
-
-    // Check for attached images with the command
-    if (event.attachments && event.attachments.length > 0) {
-        const imageAttachment = event.attachments.find(att => att.type === "photo");
-        if (imageAttachment) {
-            api.sendMessage("🖼️ ছবি আপলোড করা হচ্ছে...", threadID, event.messageID);
-            try {
-                const form = new FormData();
-                const imageStream = await axios.get(imageAttachment.url, { responseType: 'stream' });
-                form.append('image', imageStream.data, { filename: 'image.jpg', contentType: imageAttachment.contentType || 'image/jpeg' });
-
-                const uploadResponse = await axios.post("https://nayan-gemini-api.onrender.com/upload", form, {
-                    headers: form.getHeaders(),
-                    maxContentLength: Infinity,
-                    maxBodyLength: Infinity,
-                });
-
-                if (uploadResponse.data.success && uploadResponse.data.imageUrl) {
-                    imageUrl = uploadResponse.data.imageUrl;
-                    console.log("Image uploaded via /gemini command:", imageUrl);
-                } else {
-                    console.error("Image upload failed via /gemini command:", uploadResponse.data);
-                    return api.sendMessage("ছবি আপলোড করতে সমস্যা হয়েছে।", threadID, event.messageID);
-                }
-            } catch (error) {
-                console.error("Error uploading image via /gemini command:", error);
-                return api.sendMessage("ছবি আপলোড করার সময় একটি ত্রুটি হয়েছে।", threadID, event.messageID);
-            }
-        }
-    }
-
-    // If no text prompt and an image is present, set a default prompt for the image
-    if (!userPrompt && imageUrl) {
-        userPrompt = "ছবিতে কী আছে?";
-    } else if (!userPrompt && !imageUrl) {
-         // Should ideally be caught by the initial !input check, but good for robustness
-         return api.sendMessage(
-            "🧠 Gemini ব্যবহারের জন্য কিছু লিখুন অথবা একটি ছবি দিন।",
+            "🧠 Gemini ব্যবহারের জন্য কিছু লিখুন। যেমন:\n/gemini কোয়ান্টাম ফিজিক্স ব্যাখ্যা করো",
             threadID,
             event.messageID
         );
     }
 
     api.sendMessage("🤖 Gemini তোমার প্রশ্নের উত্তর খুঁজছে...", threadID);
-    const reply = await askGemini(userPrompt, threadID, imageUrl);
+    const reply = await askGemini(input, threadID);
     return api.sendMessage(`🤖 Gemini:\n\n${reply}`, threadID, event.messageID);
 };
 
@@ -276,51 +235,15 @@ module.exports.run = async function ({ api, event, args }) {
 module.exports.handleEvent = async function ({ api, event }) {
     const threadID = event.threadID;
 
-    // Only proceed if auto-reply is enabled for this thread, not from bot itself, and has content
+    // Only proceed if auto-reply is enabled for this thread, not from bot itself, and has text content
     if (!autoReplyState[threadID]) return;
     if (event.senderID == api.getCurrentUserID()) return;
-    // Ensure there's either text body or attachments
-    if (!event.body && (!event.attachments || event.attachments.length === 0)) return;
+    // Ensure there's text body
+    if (!event.body) return;
     // Ignore if message starts with a command prefix
-    if (event.body && (event.body.startsWith("/") || event.body.startsWith("!"))) return;
+    if (event.body.startsWith("/") || event.body.startsWith("!")) return;
 
-    let userPrompt = event.body || "ছবিতে কী আছে?"; // Default prompt if only an image is sent
-    let imageUrl = null;
-
-    // Check for attached images in auto-reply mode
-    if (event.attachments && event.attachments.length > 0) {
-        const imageAttachment = event.attachments.find(att => att.type === "photo");
-        if (imageAttachment) {
-            api.sendMessage("🖼️ ছবি আপলোড করা হচ্ছে...", threadID);
-            try {
-                const form = new FormData();
-                const imageStream = await axios.get(imageAttachment.url, { responseType: 'stream' });
-                form.append('image', imageStream.data, { filename: 'image.jpg', contentType: imageAttachment.contentType || 'image/jpeg' });
-
-                const uploadResponse = await axios.post("https://nayan-gemini-api.onrender.com/upload", form, {
-                    headers: form.getHeaders(),
-                    maxContentLength: Infinity,
-                    maxBodyLength: Infinity,
-                });
-
-                if (uploadResponse.data.success && uploadResponse.data.imageUrl) {
-                    imageUrl = uploadResponse.data.imageUrl;
-                    console.log("Image uploaded via auto-responder:", imageUrl);
-                } else {
-                    console.error("Image upload failed via auto-responder:", uploadResponse.data);
-                    return api.sendMessage("ছবি আপলোড করতে সমস্যা হয়েছে।", threadID, event.messageID);
-                }
-            } catch (error) {
-                console.error("Error uploading image via auto-responder:", error);
-                return api.sendMessage("ছবি আপলোড করার সময় একটি ত্রুটি হয়েছে।", threadID, event.messageID);
-            }
-        }
-    }
-
-    // Only send to Gemini if there's a prompt (text or derived from image) or an image URL
-    if (userPrompt || imageUrl) {
-        api.sendMessage("🤖 Gemini তোমার প্রশ্নের উত্তর খুঁজছে...", threadID);
-        const reply = await askGemini(userPrompt, threadID, imageUrl);
-        api.sendMessage(`🤖 Gemini:\n\n${reply}`, threadID, event.messageID);
-    }
+    api.sendMessage("🤖 Gemini তোমার প্রশ্নের উত্তর খুঁজছে...", threadID);
+    const reply = await askGemini(event.body, threadID);
+    api.sendMessage(`🤖 Gemini:\n\n${reply}`, threadID, event.messageID);
 };
